@@ -1,281 +1,300 @@
+# main.py
+# Prompt-Generator Analyze API (full, from-scratch)
 import io
 import os
 import logging
-from typing import Optional, List, Dict, Any
-
-from collections import Counter
+from typing import Optional, Dict, Any, Tuple, List
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from PIL import Image
+from PIL import Image, ImageStat
 import numpy as np
 import exifread
 
-# ---------------------------------------------------------
-# App & Logging
-# ---------------------------------------------------------
-app = FastAPI(
-    title="Image Analyze API",
-    version="1.0.0",
-    description="Receives an uploaded image (multipart/form-data) and returns technical + basic narrative analysis."
-)
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
+MAX_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(15 * 1024 * 1024)))  # 15MB
+REQUIRE_API_KEY = bool(os.getenv("ANALYZE_API_KEY"))  # header kontrolü, varsa zorunlu
+ALLOWED_MIME = {
+    "image/jpeg",
+    "image/jpg",
+    "image/png",
+    "image/webp",
+}
 
-# Basic logger
+USE_GOOGLE_VISION = os.getenv("USE_GOOGLE_VISION", "0") == "1"  # İstersek sonra açarız
+# -----------------------------------------------------------------------------
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app")
-app.logger = logger  # type: ignore[attr-defined]
 
-# CORS (GPT Actions ve Postman testleri için açık)
+app = FastAPI(
+    title="Prompt-Generator Analyze API",
+    version="1.0.0",
+    description="Uploads bir görseli teknik + görsel analiz eder ve JSON döner.",
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # dilersen burada domain kısıtlayabilirsin
+    allow_origins=["*"],  # GPT Actions ve Swagger için açık
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------
-# Config
-# ---------------------------------------------------------
-ANALYZE_API_KEY = os.getenv("ANALYZE_API_KEY", "").strip()
-USE_GOOGLE_VISION = os.getenv("USE_GOOGLE_VISION", "0").strip() in ("1", "true", "TRUE")
+# -----------------------------------------------------------------------------
+# Modeller
+# -----------------------------------------------------------------------------
+class AnalyzeResult(BaseModel):
+    width: int
+    height: int
+    aspect_ratio: str
+    mode: str
+    approx_megapixels: float
+    exif: Dict[str, Any]
+    histogram_mean: float
+    histogram_stddev: float
+    brightness_estimate: float
+    color_palette_hex: List[str]
+    color_palette_ratio: List[float]
 
-# ---------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------
-def open_image_from_upload(upload: UploadFile) -> Image.Image:
-    """
-    UploadFile içeriğini okur, PIL Image olarak döndürür.
-    """
+
+# -----------------------------------------------------------------------------
+# Yardımcılar
+# -----------------------------------------------------------------------------
+def require_key_or_403(x_api_key: Optional[str]):
+    if not REQUIRE_API_KEY:
+        return
+    must = os.getenv("ANALYZE_API_KEY", "").strip()
+    if not must:
+        # Ortam değişkeni yoksa gerektirme
+        return
+    if (x_api_key or "").strip() != must:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+def read_file_from_upload(upload: UploadFile) -> bytes:
     content = upload.file.read()
     if not content:
-        raise ValueError("Empty file content")
+        raise HTTPException(status_code=422, detail="Empty file.")
+    if len(content) > MAX_BYTES:
+        raise HTTPException(status_code=413, detail=f"File too large (>{MAX_BYTES} bytes).")
+    return content
 
-    # Reset pointer for other consumers if needed
-    bio = io.BytesIO(content)
-    img = Image.open(bio).convert("RGB")
-    return img
-
-def read_exif(content_bytes: bytes) -> Dict[str, Any]:
-    """
-    EXIF okumaya çalışır (PNG'lerde genelde yoktur). Hata olmazsa tag'leri döndürür.
-    """
-    tags: Dict[str, Any] = {}
+def get_image_from_bytes(b: bytes) -> Image.Image:
     try:
-        tags = exifread.process_file(io.BytesIO(content_bytes), details=False)
+        im = Image.open(io.BytesIO(b))
+        im.load()
+        return im
     except Exception:
-        # PNG'lerde normal; sessizce geç
-        pass
+        raise HTTPException(status_code=415, detail="Unsupported image or corrupted bytes.")
+
+def aspect_ratio_str(w: int, h: int) -> str:
+    if h == 0:
+        return "N/A"
+    # sadeleştir
+    def gcd(a, b):
+        while b:
+            a, b = b, a % b
+        return a
+    g = gcd(w, h)
+    return f"{w//g}:{h//g}"
+
+def try_read_exif(jpeg_like_bytes: bytes) -> Dict[str, Any]:
+    # PNG'de EXIF yok; JPEG/JPG/WebP bazı durumlarda olur
+    tags = {}
+    try:
+        stream = io.BytesIO(jpeg_like_bytes)
+        stream.seek(0)
+        tags_raw = exifread.process_file(stream, details=False)
+        for k, v in tags_raw.items():
+            tags[k] = str(v)
+        if not tags:
+            logger.info("PNG/JPG EXIF not found or minimal.")
+    except Exception as e:
+        logger.warning(f"EXIF read failed: {e}")
     return tags
 
-def top3_palette(img: Image.Image) -> List[Dict[str, Any]]:
+def rgb_to_hex(rgb: Tuple[int, int, int]) -> str:
+    return "#{:02x}{:02x}{:02x}".format(*rgb)
+
+def simple_kmeans(arr: np.ndarray, k=3, iters=12, seed=42) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Hızlı ve bağımlılıksız baskın renkler: downscale + Counter (en çok görünen 3 renk).
+    Basit KMeans (sklearn'siz) - arr: (N,3) uint8 -> centers:(k,3), labels:(N,)
     """
-    arr = np.array(img)
-    # downscale
-    small = arr[::8, ::8, :].reshape(-1, 3)
-    small_tuples = list(map(tuple, small.tolist()))
-    common = Counter(small_tuples).most_common(3)
-    return [{"rgb": list(rgb), "count": int(cnt)} for rgb, cnt in common]
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(arr.shape[0], size=k, replace=False)
+    centers = arr[idx].astype(np.float32)
 
-def guess_format(filename: str) -> str:
-    lower = (filename or "").lower()
-    if lower.endswith(".png"):
-        return "png"
-    if lower.endswith(".jpg") or lower.endswith(".jpeg"):
-        return "jpg"
-    if lower.endswith(".webp"):
-        return "webp"
-    if lower.endswith(".gif"):
-        return "gif"
-    return "unknown"
+    for _ in range(iters):
+        # L2 uzaklık
+        dists = np.sqrt(((arr[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2))  # (N,k)
+        labels = np.argmin(dists, axis=1)
+        new_centers = np.zeros_like(centers)
+        for ci in range(k):
+            mask = labels == ci
+            if np.any(mask):
+                new_centers[ci] = arr[mask].mean(axis=0)
+            else:
+                # boş kümeye denk gelirse rastgele ata
+                new_centers[ci] = arr[rng.integers(0, arr.shape[0])]
+        if np.allclose(new_centers, centers):
+            centers = new_centers
+            break
+        centers = new_centers
+    return centers.astype(np.uint8), labels
 
-# (Opsiyonel) Google Vision
-def run_google_vision_if_enabled(content_bytes: bytes) -> Dict[str, Any]:
+def dominant_palette(im: Image.Image, k=3) -> Tuple[List[str], List[float]]:
     """
-    USE_GOOGLE_VISION=1 ise Google Cloud Vision ile basit label/landmark/face özetleri alır.
-    Hata olursa sessizce geçer.
+    Küçült, RGB'ye çevir, KMeans ile palet çıkar.
     """
-    result: Dict[str, Any] = {}
-    if not USE_GOOGLE_VISION:
-        return result
-    try:
-        from google.cloud import vision  # type: ignore
-        client = vision.ImageAnnotatorClient()
-        image = vision.Image(content=content_bytes)
+    thumb = im.copy().convert("RGB")
+    thumb.thumbnail((320, 320))
+    arr = np.asarray(thumb, dtype=np.uint8).reshape(-1, 3)
+    centers, labels = simple_kmeans(arr, k=k)
+    # oranlar
+    counts = np.bincount(labels, minlength=k).astype(np.float64)
+    ratios = (counts / counts.sum()).tolist()
+    # merkezleri parlaklıkça sıralayalım (opsiyonel)
+    brightness = centers.mean(axis=1)
+    order = np.argsort(-brightness)  # en parlak önce
+    hexes = [rgb_to_hex(tuple(centers[i])) for i in order]
+    ratios_sorted = [ratios[i] for i in order]
+    return hexes, ratios_sorted
 
-        # Label detection
-        labels_resp = client.label_detection(image=image)
-        labels = [f"{l.description} ({round(l.score,2)})" for l in labels_resp.label_annotations or []]
+def basic_stats(im: Image.Image) -> Tuple[float, float, float]:
+    """
+    Histogram tabanlı ortalama, stddev, kabaca parlaklık tahmini (0-255).
+    """
+    gray = im.convert("L")
+    stat = ImageStat.Stat(gray)
+    mean = float(stat.mean[0])
+    # stddev elde et
+    # Pillow Stat'ta stddev yoksa var_yı kullan
+    if hasattr(stat, "stddev") and stat.stddev:
+        std = float(stat.stddev[0])
+    else:
+        var = float(stat.var[0]) if hasattr(stat, "var") and stat.var else 0.0
+        std = var ** 0.5
+    brightness = mean  # 0-255 skalası
+    return mean, std, brightness
 
-        # Landmark detection
-        lm_resp = client.landmark_detection(image=image)
-        landmarks = [f"{lm.description} ({round(lm.score,2)})" for lm in lm_resp.landmark_annotations or []]
+def pull_first_file_from_any_key(form: Dict[str, Any]) -> Tuple[Optional[str], Optional[UploadFile]]:
+    """
+    Form içindeki ilk dosya alanını yakalar (anahtar adı ne olursa olsun).
+    """
+    for k, v in form.items():
+        # v: UploadFile tipinde mi?
+        if hasattr(v, "filename") and v.filename:
+            return k, v
+    return None, None
 
-        # Face detection (sadece count & likelihood)
-        face_resp = client.face_detection(image=image)
-        faces_info = []
-        for f in face_resp.face_annotations or []:
-            faces_info.append({
-                "joy": str(f.joy_likelihood),
-                "sorrow": str(f.sorrow_likelihood),
-                "anger": str(f.anger_likelihood),
-                "surprise": str(f.surprise_likelihood)
-            })
-
-        result = {
-            "labels": labels[:10],
-            "landmarks": landmarks[:5],
-            "faces_likelihood": faces_info[:5]
-        }
-    except Exception as e:
-        app.logger.info(f"Google Vision skipped or failed: {e}")
-    return result
-
-# ---------------------------------------------------------
-# Schemas
-# ---------------------------------------------------------
-class HealthOut(BaseModel):
-    status: str = "ok"
-
-class AnalyzeOut(BaseModel):
-    technical: Dict[str, Any]
-    narrative: Dict[str, Any]
-    warnings: List[str] = []
-    vision: Optional[Dict[str, Any]] = None
-
-# ---------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Routes
-# ---------------------------------------------------------
-@app.get("/", response_model=HealthOut)
+# -----------------------------------------------------------------------------
+@app.get("/", tags=["root"])
 def root():
-    return HealthOut(status="ok")
+    return {"ok": True, "message": "Prompt-Generator Analyze API"}
 
-@app.get("/health", response_model=HealthOut)
+@app.get("/health", tags=["root"])
 def health():
-    return HealthOut(status="ok")
+    return {"status": "healthy"}
 
-@app.post("/analyze-image", response_model=AnalyzeOut)
+@app.post("/echo-upload", tags=["debug"])
+async def echo_upload(file: Optional[UploadFile] = File(default=None), x_api_key: Optional[str] = Header(default=None)):
+    require_key_or_403(x_api_key)
+    if file is None:
+        # multipart geliyor mu teyit için Request.form() ile de bakabiliriz
+        raise HTTPException(status_code=422, detail="No file uploaded (use 'file' field).")
+    content = read_file_from_upload(file)
+    return {
+        "used_field": "file",
+        "filename": file.filename,
+        "content_type": file.content_type,
+        "bytes": len(content),
+    }
+
+@app.post("/echo-anyfile", tags=["debug"])
+async def echo_anyfile(request: Request, x_api_key: Optional[str] = Header(default=None)):
+    require_key_or_403(x_api_key)
+    form = await request.form()
+    key, uf = pull_first_file_from_any_key(form)
+    if uf is None:
+        raise HTTPException(status_code=422, detail="No file found in multipart form-data")
+    b = await uf.read()
+    if not b:
+        raise HTTPException(status_code=422, detail="Empty file")
+    if len(b) > MAX_BYTES:
+        raise HTTPException(status_code=413, detail=f"File too large (>{MAX_BYTES} bytes)")
+    return {
+        "used_field": key,
+        "filename": uf.filename,
+        "content_type": getattr(uf, "content_type", None),
+        "bytes": len(b),
+    }
+
+@app.post("/analyze-image", response_model=AnalyzeResult, tags=["analyze"])
 async def analyze_image(
-    file: UploadFile = File(...),
-    x_api_key: str = Header(...)
+    request: Request,
+    file: Optional[UploadFile] = File(default=None),   # standart ad
+    image: Optional[UploadFile] = File(default=None),  # bazı istemciler 'image' gönderir
+    x_api_key: Optional[str] = Header(default=None),
 ):
+    require_key_or_403(x_api_key)
 
-    # API Key kontrolü
-    if ANALYZE_API_KEY:
-        if not x_api_key or x_api_key != ANALYZE_API_KEY:
-            raise HTTPException(status_code=401, detail="Unauthorized")
+    # 1) Önce parametrelerden yakalamaya çalış
+    picked: Optional[UploadFile] = file or image
 
-    # Hangi alan geldi?
-    # (GPT bazen 'file', bazen 'image' alan adını kullanabiliyor.)
-    upload = file or image
-    # Ekstra: hangi alan adları gelmiş, loglayalım
-    try:
+    # 2) Bulunamazsa form'u tarayıp ilk dosyayı çek
+    if picked is None:
         form = await request.form()
-        app.logger.info(f"Form fields: {list(form.keys())}")
-    except Exception:
+        _, picked = pull_first_file_from_any_key(form)
+
+    if picked is None:
+        raise HTTPException(status_code=422, detail="No file found. Send multipart/form-data with an image.")
+
+    # Boyut ve tip kontrolü
+    ctype = (picked.content_type or "").lower()
+    # Not: Bazı istemciler ctype boş geçebilir, o yüzden sadece uyarı logla
+    if ctype and ctype not in ALLOWED_MIME:
+        logger.warning(f"Unusual content-type: {ctype} (allowed: {ALLOWED_MIME})")
+
+    # Bytes oku
+    raw = await picked.read()
+    if not raw:
+        raise HTTPException(status_code=422, detail="Empty file bytes.")
+    if len(raw) > MAX_BYTES:
+        raise HTTPException(status_code=413, detail=f"File too large (>{MAX_BYTES} bytes).")
+
+    # PIL Image
+    im = get_image_from_bytes(raw)
+    w, h = im.size
+
+    # Basit istatistikler
+    h_mean, h_std, brightness = basic_stats(im)
+
+    # Renk paleti (3 renk)
+    hexes, ratios = dominant_palette(im, k=3)
+
+    # EXIF (varsa)
+    exif = try_read_exif(raw)
+
+    # (İleride) Google Vision kapalı
+    if USE_GOOGLE_VISION:
+        # Buraya Vision ile obje/detay analizi eklenebilir
         pass
 
-    if upload is None or getattr(upload, "filename", None) is None:
-        raise HTTPException(status_code=422, detail="No file found in form-data. Expected field 'file' (or 'image').")
-
-    filename = upload.filename or ""
-    fmt = guess_format(filename)
-
-    # Dosyayı bytes olarak da alalım (EXIF & Vision için)
-    try:
-        content_bytes = await upload.read()
-        if not content_bytes:
-            raise ValueError("Empty file content")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not read file: {e}")
-
-    # PIL ile aç
-    try:
-        img = Image.open(io.BytesIO(content_bytes)).convert("RGB")
-    except Exception as e:
-        raise HTTPException(status_code=415, detail=f"Unsupported image or read error: {e}")
-
-    # EXIF
-    warnings: List[str] = []
-    tags = read_exif(content_bytes)
-    if not tags:
-        app.logger.info("PNG/JPG EXIF not found or minimal.")
-        warnings.append("No EXIF or minimal EXIF (normal for many PNGs).")
-
-    # Teknik bilgiler
-    np_img = np.array(img)
-    h, w = np_img.shape[:2]
-    palette = top3_palette(img)
-
-    technical = {
-        "filename": filename,
-        "format_guess": fmt,
-        "resolution": {"width": int(w), "height": int(h)},
-        "approx_palette_top3": palette,
-        "exif_present": bool(tags),
-    }
-
-    # Basit anlatı (narrative) iskeleti — asıl derin analiz GPT tarafında yapılacak
-    narrative = {
-        "notes": "Basic technical cues extracted. Use these as grounding for your cinematic prompt builder.",
-        "hints": [
-            "If human subject: confirm age/gender/ethnicity & micro-imperfections.",
-            "Confirm lighting type (natural/artificial), softness/hardness, direction.",
-            "Confirm camera angle & focal length intent; add aperture for bokeh level.",
-            "Describe environment style & texture (asphalt, neon, graffitis), imperfections.",
-            "Add color palette as 60/30/10 using detected top colors + your taste."
-        ]
-    }
-
-    # (Opsiyonel) Google Vision
-    vision = run_google_vision_if_enabled(content_bytes)
-    if vision:
-        technical["vision_labels_count"] = len(vision.get("labels", []))
-
-    return AnalyzeOut(
-        technical=technical,
-        narrative=narrative,
-        warnings=warnings,
-        vision=vision or None
+    return AnalyzeResult(
+        width=w,
+        height=h,
+        aspect_ratio=aspect_ratio_str(w, h),
+        mode=str(im.mode),
+        approx_megapixels=round((w * h) / 1_000_000.0, 3),
+        exif=exif,
+        histogram_mean=round(h_mean, 3),
+        histogram_stddev=round(h_std, 3),
+        brightness_estimate=round(brightness, 3),
+        color_palette_hex=hexes,
+        color_palette_ratio=[round(x, 4) for x in ratios],
     )
-
-# ---- DIAGNOSTIC ENDPOINTS (add near the end of main.py) ----
-from fastapi import Request
-
-@app.post("/echo-multipart")
-async def echo_multipart(request: Request, x_api_key: str = Header(None)):
-    # API key kontrolünü isteğe bağlı yapıyoruz; istersen zorunlu da kılabiliriz
-    form = await request.form()
-    # Gelen tüm alanları ve varsa dosya adlarını döndür
-    fields = {}
-    for k, v in form.items():
-        if hasattr(v, "filename") and v.filename:
-            fields[k] = {"filename": v.filename, "content_type": getattr(v, "content_type", None)}
-        else:
-            fields[k] = str(v)
-    return {
-        "received_keys": list(form.keys()),
-        "fields": fields,
-        "headers_subset": {
-            "content-type": request.headers.get("content-type"),
-            "content-length": request.headers.get("content-length"),
-            "x-api-key": request.headers.get("x-api-key"),
-        }
-    }
-
-@app.post("/echo-upload")
-async def echo_upload(file: UploadFile = File(None), image: UploadFile = File(None), x_api_key: str = Header(None)):
-    up = file or image
-    if up is None:
-        raise HTTPException(status_code=422, detail="No file uploaded (expected 'file' or 'image').")
-    content = await up.read()
-    return {
-        "used_field": "file" if (file and file.filename) else "image",
-        "filename": up.filename,
-        "content_type": up.content_type,
-        "bytes": len(content)
-    }
-# ---- /DIAGNOSTIC ENDPOINTS ----
