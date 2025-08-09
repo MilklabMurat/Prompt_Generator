@@ -31,7 +31,34 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+from fastapi.responses import HTMLResponse
 
+@app.get("/privacy", response_class=HTMLResponse)
+def privacy():
+    return """
+    <html><head><meta charset="utf-8"><title>Privacy Policy</title></head>
+    <body style="font-family:system-ui;max-width:800px;margin:40px auto;line-height:1.6">
+      <h1>Privacy Policy</h1>
+      <p>This service receives images you upload to analyze technical features (EXIF, colors, labels) and returns structured JSON.</p>
+      <p>We do not sell your data. Uploaded files are processed in-memory and not retained longer than needed to fulfill the request.</p>
+      <p>API access is protected via an API key. Do not share your key publicly.</p>
+      <p>Contact: <a href="mailto:you@example.com">you@example.com</a></p>
+      <p>Last updated: 2025-08-09</p>
+    </body></html>
+    """
+
+@app.get("/terms", response_class=HTMLResponse)
+def terms():
+    return """
+    <html><head><meta charset="utf-8"><title>Terms of Use</title></head>
+    <body style="font-family:system-ui;max-width:800px;margin:40px auto;line-height:1.6">
+      <h1>Terms of Use</h1>
+      <p>Use this API at your own risk. You must own the rights to any content you upload. No unlawful content.</p>
+      <p>We may rate-limit or revoke access if abuse is detected. No guarantees of availability or fitness for a particular purpose.</p>
+      <p>Contact: <a href="mailto: info@milklab.com">info@milklab.com</a></p>
+      <p>Last updated: 2025-08-09</p>
+    </body></html>
+    """
 # ------------------------------------------------------
 # MODELS
 # ------------------------------------------------------
