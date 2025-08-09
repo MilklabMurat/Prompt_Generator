@@ -159,11 +159,10 @@ def health():
 
 @app.post("/analyze-image", response_model=AnalyzeOut)
 async def analyze_image(
-    request: Request,
-    file: Optional[UploadFile] = File(None),
-    image: Optional[UploadFile] = File(None),
-    x_api_key: Optional[str] = Header(None)
+    file: UploadFile = File(...),
+    x_api_key: str = Header(...)
 ):
+
     # API Key kontrolü
     if ANALYZE_API_KEY:
         if not x_api_key or x_api_key != ANALYZE_API_KEY:
