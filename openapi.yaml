@@ -1,0 +1,93 @@
+openapi: 3.0.3
+info:
+  title: Image Analyze API
+  version: "1.0.0"
+paths:
+  /analyze-image:
+    post:
+      summary: Analyze uploaded image for EXIF, palette, lighting/camera guess, and optional vision labels
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        "200":
+          description: Analysis result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Analysis"
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: x-api-key
+  schemas:
+    Lighting:
+      type: object
+      properties:
+        type: { type: string }
+        quality: { type: string }
+        direction: { type: string }
+        ratio: { type: string }
+    CameraGuess:
+      type: object
+      properties:
+        angle: { type: string }
+        lens_guess_mm: { type: integer, nullable: true }
+        aperture_guess: { type: string, nullable: true }
+    Technical:
+      type: object
+      properties:
+        lighting:
+          $ref: "#/components/schemas/Lighting"
+        camera:
+          $ref: "#/components/schemas/CameraGuess"
+        palette_60_30_10:
+          type: array
+          items: { type: string }
+        atmosphere:
+          type: array
+          items: { type: string }
+    ExifData:
+      type: object
+      properties:
+        camera_model: { type: string, nullable: true }
+        lens: { type: string, nullable: true }
+        focal_length_mm: { type: number, nullable: true }
+        iso: { type: integer, nullable: true }
+        shutter_s: { type: number, nullable: true }
+        aperture_f: { type: number, nullable: true }
+        aspect_ratio: { type: string, nullable: true }
+    Narrative:
+      type: object
+      properties:
+        subject: { type: string, nullable: true }
+        emotion: { type: string, nullable: true }
+        environment: { type: string, nullable: true }
+        action_main: { type: string, nullable: true }
+        secondary_characters:
+          type: array
+          items: { type: string }
+        props:
+          type: array
+          items: { type: string }
+        interaction: { type: string, nullable: true }
+    Analysis:
+      type: object
+      properties:
+        exif: { $ref: "#/components/schemas/ExifData" }
+        technical: { $ref: "#/components/schemas/Technical" }
+        narrative: { $ref: "#/components/schemas/Narrative" }
+        confidence:
+          type: object
+          additionalProperties: { type: number }
