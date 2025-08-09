@@ -1,263 +1,363 @@
+# main.py
 import io
 import os
-from typing import Optional, List, Dict
+import sys
+import logging
+from typing import Dict, List, Optional
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from PIL import Image
 import numpy as np
 import exifread
-import numpy as np
-from PIL import Image
 
-def simple_kmeans(arr: np.ndarray, k=3, iters=12, seed=42):
+# ------------------------------------------------------
+# Logging
+# ------------------------------------------------------
+logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+logger = logging.getLogger("app")
+
+# ------------------------------------------------------
+# FastAPI app & CORS
+# ------------------------------------------------------
+app = FastAPI(title="Prompt Generator Analyze API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # İstersen domain kısıtlayabilirsin
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ------------------------------------------------------
+# MODELS
+# ------------------------------------------------------
+class EXIFModel(BaseModel):
+    camera: Optional[str] = None
+    lens: Optional[str] = None
+    focal_length: Optional[float] = None
+    aperture: Optional[float] = None
+    iso: Optional[int] = None
+    shutter: Optional[str] = None
+    timestamp: Optional[str] = None
+
+class ColorItem(BaseModel):
+    hex: str
+    rgb: Dict[str, int]
+    name: str
+
+class TechModel(BaseModel):
+    exif: Optional[EXIFModel] = None
+    palette: Optional[List[ColorItem]] = None
+    vision_labels: Optional[List[str]] = None
+
+class NarrativeModel(BaseModel):
+    setting: Optional[str] = None
+    subjects: Optional[List[str]] = None
+    mood: Optional[str] = None
+    actions: Optional[List[str]] = None
+
+class AnalyzeResponse(BaseModel):
+    status: str
+    tech: TechModel
+    narrative: NarrativeModel
+    errors: Dict[str, str] = {}
+
+# ------------------------------------------------------
+# Helpers: EXIF
+# ------------------------------------------------------
+def _to_float(val) -> Optional[float]:
+    try:
+        return float(str(val))
+    except Exception:
+        return None
+
+def _to_int(val) -> Optional[int]:
+    try:
+        return int(str(val))
+    except Exception:
+        return None
+
+def extract_exif_from_bytes(content: bytes) -> EXIFModel:
     """
-    arr: (N,3) float32 RGB array
-    k: clusters
-    returns: (k,3) int centers
+    EXIF bilgilerini bytes üzerinden okur. PNG'lerde çoğunlukla EXIF yoktur.
     """
-    rng = np.random.default_rng(seed)
-    # init: rastgele k piksel seç
-    idx = rng.choice(arr.shape[0], size=k, replace=False)
-    centers = arr[idx].copy()  # (k,3)
-    for _ in range(iters):
-        # uzaklık ve atama
-        dists = ((arr[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
-        labels = dists.argmin(axis=1)
-        # yeni merkezler
-        new_centers = []
-        for ci in range(k):
-            pts = arr[labels == ci]
-            if pts.size == 0:
-                # boş küme: rasgele yeniden başlat
-                new_centers.append(arr[rng.integers(0, arr.shape[0])])
-            else:
-                new_centers.append(pts.mean(axis=0))
-        new_centers = np.stack(new_centers, axis=0)
-        if np.allclose(new_centers, centers, atol=1e-3):
-            centers = new_centers
+    try:
+        stream = io.BytesIO(content)
+        tags = exifread.process_file(stream, details=False)
+
+        # Bazı tipik alanlar
+        camera = str(tags.get("Image Model") or "") or None
+        lens = str(tags.get("EXIF LensModel") or "") or None
+
+        focal = tags.get("EXIF FocalLength")
+        aperture = tags.get("EXIF FNumber")
+        iso = tags.get("EXIF ISOSpeedRatings") or tags.get("EXIF PhotographicSensitivity")
+        shutter = tags.get("EXIF ExposureTime")
+        dt = tags.get("EXIF DateTimeOriginal") or tags.get("Image DateTime")
+
+        focal_val = None
+        if focal:
+            # "85/1" gibi gelebilir
+            try:
+                s = str(focal)
+                if "/" in s:
+                    num, den = s.split("/")
+                    focal_val = float(num) / float(den)
+                else:
+                    focal_val = float(s)
+            except Exception:
+                focal_val = None
+
+        aperture_val = None
+        if aperture:
+            try:
+                s = str(aperture)
+                if "/" in s:
+                    num, den = s.split("/")
+                    aperture_val = float(num) / float(den)
+                else:
+                    aperture_val = float(s)
+            except Exception:
+                aperture_val = None
+
+        iso_val = _to_int(iso) if iso else None
+        shutter_val = str(shutter) if shutter else None
+        ts_val = str(dt) if dt else None
+
+        # Boş ise None dönelim
+        if not any([camera, lens, focal_val, aperture_val, iso_val, shutter_val, ts_val]):
+            logger.info("PNG/JPG EXIF not found or minimal.")
+            return EXIFModel()
+
+        return EXIFModel(
+            camera=camera,
+            lens=lens,
+            focal_length=focal_val,
+            aperture=aperture_val,
+            iso=iso_val,
+            shutter=shutter_val,
+            timestamp=ts_val,
+        )
+    except Exception as e:
+        logger.exception("EXIF parse failed")
+        return EXIFModel()
+
+# ------------------------------------------------------
+# Helpers: Palette (no sklearn)
+# ------------------------------------------------------
+def _approx_color_name(rgb):
+    r, g, b = rgb
+    if r > 200 and g > 200 and b > 200:
+        return "white"
+    if r < 35 and g < 35 and b < 35:
+        return "black"
+    if r > g and r > b:
+        return "red-ish"
+    if g > r and g > b:
+        return "green-ish"
+    if b > r and b > g:
+        return "blue-ish"
+    if r > 180 and g > 180 and b < 100:
+        return "yellow-ish"
+    if r > 180 and b > 180 and g < 100:
+        return "magenta-ish"
+    if g > 180 and b > 180 and r < 100:
+        return "cyan-ish"
+    return "neutral"
+
+def cluster_palette(img: Image.Image, k: int = 3) -> List[Dict]:
+    """
+    Pillow ADAPTIVE palette ile hafif palet çıkarımı.
+    """
+    small = img.convert("RGB").resize((128, 128))
+    colors_target = max(k * 3, k)
+    pal_img = small.convert("P", palette=Image.Palette.ADAPTIVE, colors=colors_target)
+
+    palette = pal_img.getpalette()  # [r0,g0,b0, r1,g1,b1, ...]
+    counts = pal_img.getcolors() or []  # [(count, index), ...]
+
+    def idx_to_rgb(idx: int):
+        base = idx * 3
+        return tuple(palette[base:base + 3])
+
+    ranked = sorted(counts, key=lambda x: x[0], reverse=True)
+
+    top = []
+    seen = set()
+    for count, idx in ranked:
+        rgb = idx_to_rgb(idx)
+        if rgb in seen:
+            continue
+        seen.add(rgb)
+        hexcol = "#{:02x}{:02x}{:02x}".format(*rgb)
+        top.append({
+            "hex": hexcol,
+            "rgb": {"r": rgb[0], "g": rgb[1], "b": rgb[2]},
+            "name": _approx_color_name(rgb)
+        })
+        if len(top) >= k:
             break
-        centers = new_centers
-    return centers.astype(int)
 
-def cluster_palette(img: Image.Image, k=3) -> list[str]:
+    return top
+
+# ------------------------------------------------------
+# Helpers: Google Vision (optional)
+# ------------------------------------------------------
+def google_vision_labels_bytes(content: bytes) -> List[str]:
     """
-    Görselden k adet baskın rengi isimlendirerek döndürür.
+    USE_GOOGLE_VISION=1 ise Google Vision ile label listesi döndürür.
     """
-    small = img.resize((128,128)).convert("RGB")
-    arr = np.array(small).reshape(-1,3).astype(np.float32)
-    centers = simple_kmeans(arr, k=k, iters=12, seed=42).tolist()
-
-    def rgb_to_name(r,g,b):
-        if r>200 and g>200 and b>200: return "soft white"
-        if r<50 and g<50 and b<50: return "charcoal"
-        if b>r and b>g: return "deep blue" if b>150 else "steel blue"
-        if g>r and g>b: return "leaf green" if g>150 else "olive"
-        if r>g and r>b: return "warm red" if r>150 else "rust"
-        return f"rgb({r},{g},{b})"
-
-    return [rgb_to_name(*c) for c in centers]
-
-USE_GOOGLE_VISION = os.getenv("USE_GOOGLE_VISION", "0") == "1"
-VISION_CLIENT = None
-if USE_GOOGLE_VISION:
-    try:
-        from google.cloud import vision
-        VISION_CLIENT = vision.ImageAnnotatorClient()
-    except Exception:
-        VISION_CLIENT = None
-
-API_KEY = os.getenv("ANALYZE_API_KEY")
-
-app = FastAPI(title="Image Analyze API", version="1.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-class Lighting(BaseModel):
-    type: str | None = None
-    quality: str | None = None
-    direction: str | None = None
-    ratio: str | None = None
-
-class CameraGuess(BaseModel):
-    angle: str | None = None
-    lens_guess_mm: int | None = None
-    aperture_guess: str | None = None
-
-class Technical(BaseModel):
-    lighting: Lighting
-    camera: CameraGuess
-    palette_60_30_10: List[str] = []
-    atmosphere: List[str] = []
-
-class ExifData(BaseModel):
-    camera_model: str | None = None
-    lens: str | None = None
-    focal_length_mm: float | None = None
-    iso: int | None = None
-    shutter_s: float | None = None
-    aperture_f: float | None = None
-    aspect_ratio: str | None = None
-
-class Narrative(BaseModel):
-    subject: str | None = None
-    emotion: str | None = None
-    environment: str | None = None
-    action_main: str | None = None
-    secondary_characters: List[str] = []
-    props: List[str] = []
-    interaction: str | None = None
-
-class Analysis(BaseModel):
-    exif: ExifData
-    technical: Technical
-    narrative: Narrative
-    confidence: Dict[str, float] = {}
-
-def require_key(x_api_key: Optional[str]):
-    if not API_KEY:
-        return
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-
-def parse_exif_bytes(img_bytes: bytes) -> ExifData:
-    try:
-        tags = exifread.process_file(io.BytesIO(img_bytes), details=False)
-    except Exception:
-        tags = {}
-    model = str(tags.get("Image Model", "")) or None
-    lens = str(tags.get("EXIF LensModel", "")) or None
-
-    focal = None
-    fr = str(tags.get("EXIF FocalLength", "")).strip()
-    if fr:
-        if "/" in fr:
-            num, den = fr.split("/", 1)
-            try: focal = float(num)/float(den)
-            except: focal = None
-        else:
-            try: focal = float(fr)
-            except: focal = None
-
-    iso = None
-    iso_tag = tags.get("EXIF ISOSpeedRatings") or tags.get("EXIF PhotographicSensitivity")
-    if iso_tag:
-        try: iso = int(str(iso_tag))
-        except: iso = None
-
-    shutter = None
-    st = tags.get("EXIF ExposureTime")
-    if st:
-        s = str(st)
-        if "/" in s:
-            num, den = s.split("/", 1)
-            try: shutter = float(num)/float(den)
-            except: shutter = None
-        else:
-            try: shutter = float(s)
-            except: shutter = None
-
-    aperture = None
-    ft = tags.get("EXIF FNumber")
-    if ft:
-        s = str(ft)
-        if "/" in s:
-            num, den = s.split("/", 1)
-            try: aperture = float(num)/float(den)
-            except: aperture = None
-        else:
-            try: aperture = float(s)
-            except: aperture = None
-
-    aspect = None
-    try:
-        im = Image.open(io.BytesIO(img_bytes))
-        w, h = im.size
-        def gcd(a,b):
-            while b: a,b = b,a%b
-            return a
-        g = gcd(w,h)
-        aspect = f"{w//g}:{h//g}"
-    except Exception:
-        pass
-
-    return ExifData(
-        camera_model=model, lens=lens, focal_length_mm=focal, iso=iso,
-        shutter_s=shutter, aperture_f=aperture, aspect_ratio=aspect
-    )
-
-def cluster_palette(img: Image.Image, k=3) -> List[str]:
-    small = img.resize((128,128)).convert("RGB")
-    arr = np.array(small).reshape(-1,3).astype(np.float32)
-    km = KMeans(n_clusters=k, n_init=5, random_state=42).fit(arr)
-    centers = km.cluster_centers_.astype(int).tolist()
-    def rgb_to_name(r,g,b):
-        if r>200 and g>200 and b>200: return "soft white"
-        if r<50 and g<50 and b<50: return "charcoal"
-        if b>r and b>g: return "deep blue" if b>150 else "steel blue"
-        if g>r and g>b: return "leaf green" if g>150 else "olive"
-        if r>g and r>b: return "warm red" if r>150 else "rust"
-        return f"rgb({r},{g},{b})"
-    return [rgb_to_name(*c) for c in centers]
-
-def guess_lighting_and_camera(im: Image.Image):
-    w, h = im.size
-    arr = np.array(im.resize((256,256)).convert("L")).astype(np.float32)
-    contrast = float(arr.std())
-    quality = "hard" if contrast > 60 else "soft"
-    direction = "ambient"
-    ratio = "2:1" if quality=="soft" else "4:1"
-    angle = "eye"
-    if h/w > 1.3: angle = "closeup"
-    return Lighting(type="mixed", quality=quality, direction=direction, ratio=ratio), CameraGuess(angle=angle)
-
-def google_vision_labels(content: bytes) -> List[str]:
-    if not (USE_GOOGLE_VISION and VISION_CLIENT):
+    if os.environ.get("USE_GOOGLE_VISION", "0") != "1":
         return []
+
     try:
-        from google.cloud import vision
+        from google.cloud import vision  # lazy import
+    except Exception as e:
+        logger.warning(f"google-cloud-vision import failed: {e}")
+        return []
+
+    try:
+        client = vision.ImageAnnotatorClient()
         image = vision.Image(content=content)
-        resp = VISION_CLIENT.label_detection(image=image)
-        return [l.description for l in resp.label_annotations]
-    except Exception:
+        resp = client.label_detection(image=image)
+        if resp.error and resp.error.message:
+            logger.error(f"Vision API error: {resp.error.message}")
+            return []
+        labels = [l.description for l in (resp.label_annotations or [])]
+        return labels
+    except Exception as e:
+        logger.exception("Vision request failed")
         return []
 
-@app.post("/analyze-image", response_model=Analysis)
-async def analyze_image(file: UploadFile, x_api_key: Optional[str] = Header(default=None)):
-    require_key(x_api_key)
-    b = await file.read()
-    if not b or len(b) > 10*1024*1024:
-        raise HTTPException(413, "Image too large or empty")
+# ------------------------------------------------------
+# Helpers: Narrative (basit otomatik özet)
+# ------------------------------------------------------
+def build_narrative(img: Image.Image, tech: Dict) -> NarrativeModel:
+    # Çok basit bir çıkarım. İstersen burada Vision label’ları, paleti, EXIF’i harmanlayıp
+    # daha akıllı bir özet üretecek şekilde genişletebiliriz.
+    labels = tech.get("vision_labels") or []
+    palette = tech.get("palette") or []
 
-    try:
-        im = Image.open(io.BytesIO(b)).convert("RGB")
-    except Exception:
-        raise HTTPException(400, "Unsupported image")
+    mood = None
+    if palette:
+        # kaba ton tahmini
+        names = [c["name"] for c in palette]
+        if "blue-ish" in names:
+            mood = "cool / melancholic"
+        elif "yellow-ish" in names:
+            mood = "warm / hopeful"
+        else:
+            mood = "neutral"
+    else:
+        mood = "neutral"
 
-    exif = parse_exif_bytes(b)
-    palette = cluster_palette(im, k=3)
-    lighting, camera = guess_lighting_and_camera(im)
-    labels = google_vision_labels(b)
+    setting = None
+    if labels:
+        # ör: "Street", "Sky", "Person" gibi
+        if "Street" in labels:
+            setting = "urban street"
+        elif "Sky" in labels:
+            setting = "outdoor with sky"
+        else:
+            setting = "unspecified"
+    else:
+        setting = "unspecified"
 
-    subject = None
-    environment = None
-    for l in labels:
-        s = l.lower()
-        if not subject and any(k in s for k in ["person","human","man","woman","girl","boy","dog","cat","bird"]):
-            subject = l
-        if not environment and any(k in s for k in ["street","city","bridge","forest","beach","mountain","building","harbor"]):
-            environment = l
+    subjects = []
+    if labels:
+        if "Person" in labels:
+            subjects.append("person")
 
-    return Analysis(
-        exif=exif,
-        technical=Technical(lighting=lighting, camera=camera, palette_60_30_10=palette, atmosphere=[]),
-        narrative=Narrative(subject=subject or "unknown subject",
-                            emotion=None,
-                            environment=environment or "unknown environment",
-                            action_main=None,
-                            secondary_characters=[],
-                            props=[],
-                            interaction=None),
-        confidence={"exif": 0.95 if exif.camera_model or exif.focal_length_mm else 0.5,
-                    "vision": 0.9 if labels else 0.5}
+    return NarrativeModel(
+        setting=setting,
+        subjects=subjects,
+        mood=mood,
+        actions=[]
     )
+
+# ------------------------------------------------------
+# Routes
+# ------------------------------------------------------
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "Prompt Generator Analyze API up"}
+
+@app.get("/healthz")
+def health():
+    return {"status": "ok"}
+
+@app.post("/analyze-image", response_model=AnalyzeResponse)
+async def analyze_image(file: UploadFile = File(...), x_api_key: str = Header(default=None)):
+    # API Key kontrolü
+    expected_key = os.environ.get("ANALYZE_API_KEY")
+    if not expected_key:
+        logger.warning("ANALYZE_API_KEY not set on server")
+        raise HTTPException(status_code=500, detail="Server missing ANALYZE_API_KEY")
+    if x_api_key != expected_key:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # Dosyayı oku + Pillow ile aç
+    try:
+        content = await file.read()
+        img = Image.open(io.BytesIO(content)).convert("RGB")
+    except Exception as e:
+        logger.exception("Image read/open failed")
+        raise HTTPException(status_code=400, detail=f"Bad image file: {type(e).__name__}: {e}")
+
+    out_errors: Dict[str, str] = {}
+    tech: Dict = {}
+    narrative: Dict = {}
+
+    # EXIF
+    try:
+        exif = extract_exif_from_bytes(content)
+        tech["exif"] = exif.model_dump()
+    except Exception as e:
+        logger.exception("EXIF failed")
+        out_errors["exif"] = f"{type(e).__name__}: {e}"
+
+    # Palette
+    try:
+        pal = cluster_palette(img, k=3)
+        tech["palette"] = pal
+    except Exception as e:
+        logger.exception("Palette failed")
+        out_errors["palette"] = f"{type(e).__name__}: {e}"
+
+    # Vision (opsiyonel)
+    try:
+        labels = google_vision_labels_bytes(content)
+        if labels:
+            tech["vision_labels"] = labels
+    except Exception as e:
+        logger.exception("Vision failed")
+        out_errors["vision"] = f"{type(e).__name__}: {e}"
+
+    # Narrative
+    try:
+        nar = build_narrative(img, tech)
+        narrative = nar.model_dump()
+    except Exception as e:
+        logger.exception("Narrative failed")
+        out_errors["narrative"] = f"{type(e).__name__}: {e}"
+
+    status = "ok" if not out_errors else "partial_success"
+
+    return AnalyzeResponse(
+        status=status,
+        tech=TechModel(**tech),
+        narrative=NarrativeModel(**narrative),
+        errors=out_errors
+    )
+
+# ------------------------------------------------------
+# Run locally (optional)
+# ------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
