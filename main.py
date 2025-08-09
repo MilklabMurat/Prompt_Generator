@@ -8,7 +8,56 @@ from pydantic import BaseModel
 from PIL import Image
 import numpy as np
 import exifread
-from sklearn.cluster import KMeans
+import numpy as np
+from PIL import Image
+
+def simple_kmeans(arr: np.ndarray, k=3, iters=12, seed=42):
+    """
+    arr: (N,3) float32 RGB array
+    k: clusters
+    returns: (k,3) int centers
+    """
+    rng = np.random.default_rng(seed)
+    # init: rastgele k piksel seç
+    idx = rng.choice(arr.shape[0], size=k, replace=False)
+    centers = arr[idx].copy()  # (k,3)
+    for _ in range(iters):
+        # uzaklık ve atama
+        dists = ((arr[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
+        labels = dists.argmin(axis=1)
+        # yeni merkezler
+        new_centers = []
+        for ci in range(k):
+            pts = arr[labels == ci]
+            if pts.size == 0:
+                # boş küme: rasgele yeniden başlat
+                new_centers.append(arr[rng.integers(0, arr.shape[0])])
+            else:
+                new_centers.append(pts.mean(axis=0))
+        new_centers = np.stack(new_centers, axis=0)
+        if np.allclose(new_centers, centers, atol=1e-3):
+            centers = new_centers
+            break
+        centers = new_centers
+    return centers.astype(int)
+
+def cluster_palette(img: Image.Image, k=3) -> list[str]:
+    """
+    Görselden k adet baskın rengi isimlendirerek döndürür.
+    """
+    small = img.resize((128,128)).convert("RGB")
+    arr = np.array(small).reshape(-1,3).astype(np.float32)
+    centers = simple_kmeans(arr, k=k, iters=12, seed=42).tolist()
+
+    def rgb_to_name(r,g,b):
+        if r>200 and g>200 and b>200: return "soft white"
+        if r<50 and g<50 and b<50: return "charcoal"
+        if b>r and b>g: return "deep blue" if b>150 else "steel blue"
+        if g>r and g>b: return "leaf green" if g>150 else "olive"
+        if r>g and r>b: return "warm red" if r>150 else "rust"
+        return f"rgb({r},{g},{b})"
+
+    return [rgb_to_name(*c) for c in centers]
 
 USE_GOOGLE_VISION = os.getenv("USE_GOOGLE_VISION", "0") == "1"
 VISION_CLIENT = None
