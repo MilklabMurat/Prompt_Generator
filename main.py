@@ -241,3 +241,41 @@ async def analyze_image(
         warnings=warnings,
         vision=vision or None
     )
+
+# ---- DIAGNOSTIC ENDPOINTS (add near the end of main.py) ----
+from fastapi import Request
+
+@app.post("/echo-multipart")
+async def echo_multipart(request: Request, x_api_key: str = Header(None)):
+    # API key kontrolünü isteğe bağlı yapıyoruz; istersen zorunlu da kılabiliriz
+    form = await request.form()
+    # Gelen tüm alanları ve varsa dosya adlarını döndür
+    fields = {}
+    for k, v in form.items():
+        if hasattr(v, "filename") and v.filename:
+            fields[k] = {"filename": v.filename, "content_type": getattr(v, "content_type", None)}
+        else:
+            fields[k] = str(v)
+    return {
+        "received_keys": list(form.keys()),
+        "fields": fields,
+        "headers_subset": {
+            "content-type": request.headers.get("content-type"),
+            "content-length": request.headers.get("content-length"),
+            "x-api-key": request.headers.get("x-api-key"),
+        }
+    }
+
+@app.post("/echo-upload")
+async def echo_upload(file: UploadFile = File(None), image: UploadFile = File(None), x_api_key: str = Header(None)):
+    up = file or image
+    if up is None:
+        raise HTTPException(status_code=422, detail="No file uploaded (expected 'file' or 'image').")
+    content = await up.read()
+    return {
+        "used_field": "file" if (file and file.filename) else "image",
+        "filename": up.filename,
+        "content_type": up.content_type,
+        "bytes": len(content)
+    }
+# ---- /DIAGNOSTIC ENDPOINTS ----
