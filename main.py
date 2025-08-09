@@ -1,390 +1,244 @@
-# main.py
 import io
 import os
-import sys
 import logging
-from typing import Dict, List, Optional
+from typing import Optional, List, Dict, Any
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Header
+from collections import Counter
+
+from fastapi import FastAPI, File, UploadFile, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from PIL import Image
 import numpy as np
 import exifread
 
-# ------------------------------------------------------
-# Logging
-# ------------------------------------------------------
-logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+# ---------------------------------------------------------
+# App & Logging
+# ---------------------------------------------------------
+app = FastAPI(
+    title="Image Analyze API",
+    version="1.0.0",
+    description="Receives an uploaded image (multipart/form-data) and returns technical + basic narrative analysis."
+)
+
+# Basic logger
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app")
+app.logger = logger  # type: ignore[attr-defined]
 
-# ------------------------------------------------------
-# FastAPI app & CORS
-# ------------------------------------------------------
-app = FastAPI(title="Prompt Generator Analyze API", version="1.0.0")
-
+# CORS (GPT Actions ve Postman testleri için açık)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # İstersen domain kısıtlayabilirsin
+    allow_origins=["*"],      # dilersen burada domain kısıtlayabilirsin
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-from fastapi.responses import HTMLResponse
 
-@app.get("/privacy", response_class=HTMLResponse)
-def privacy():
-    return """
-    <html><head><meta charset="utf-8"><title>Privacy Policy</title></head>
-    <body style="font-family:system-ui;max-width:800px;margin:40px auto;line-height:1.6">
-      <h1>Privacy Policy</h1>
-      <p>This service receives images you upload to analyze technical features (EXIF, colors, labels) and returns structured JSON.</p>
-      <p>We do not sell your data. Uploaded files are processed in-memory and not retained longer than needed to fulfill the request.</p>
-      <p>API access is protected via an API key. Do not share your key publicly.</p>
-      <p>Contact: <a href="mailto:you@example.com">you@example.com</a></p>
-      <p>Last updated: 2025-08-09</p>
-    </body></html>
+# ---------------------------------------------------------
+# Config
+# ---------------------------------------------------------
+ANALYZE_API_KEY = os.getenv("ANALYZE_API_KEY", "").strip()
+USE_GOOGLE_VISION = os.getenv("USE_GOOGLE_VISION", "0").strip() in ("1", "true", "TRUE")
+
+# ---------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------
+def open_image_from_upload(upload: UploadFile) -> Image.Image:
     """
-
-@app.get("/terms", response_class=HTMLResponse)
-def terms():
-    return """
-    <html><head><meta charset="utf-8"><title>Terms of Use</title></head>
-    <body style="font-family:system-ui;max-width:800px;margin:40px auto;line-height:1.6">
-      <h1>Terms of Use</h1>
-      <p>Use this API at your own risk. You must own the rights to any content you upload. No unlawful content.</p>
-      <p>We may rate-limit or revoke access if abuse is detected. No guarantees of availability or fitness for a particular purpose.</p>
-      <p>Contact: <a href="mailto: info@milklab.com">info@milklab.com</a></p>
-      <p>Last updated: 2025-08-09</p>
-    </body></html>
+    UploadFile içeriğini okur, PIL Image olarak döndürür.
     """
-# ------------------------------------------------------
-# MODELS
-# ------------------------------------------------------
-class EXIFModel(BaseModel):
-    camera: Optional[str] = None
-    lens: Optional[str] = None
-    focal_length: Optional[float] = None
-    aperture: Optional[float] = None
-    iso: Optional[int] = None
-    shutter: Optional[str] = None
-    timestamp: Optional[str] = None
+    content = upload.file.read()
+    if not content:
+        raise ValueError("Empty file content")
 
-class ColorItem(BaseModel):
-    hex: str
-    rgb: Dict[str, int]
-    name: str
+    # Reset pointer for other consumers if needed
+    bio = io.BytesIO(content)
+    img = Image.open(bio).convert("RGB")
+    return img
 
-class TechModel(BaseModel):
-    exif: Optional[EXIFModel] = None
-    palette: Optional[List[ColorItem]] = None
-    vision_labels: Optional[List[str]] = None
-
-class NarrativeModel(BaseModel):
-    setting: Optional[str] = None
-    subjects: Optional[List[str]] = None
-    mood: Optional[str] = None
-    actions: Optional[List[str]] = None
-
-class AnalyzeResponse(BaseModel):
-    status: str
-    tech: TechModel
-    narrative: NarrativeModel
-    errors: Dict[str, str] = {}
-
-# ------------------------------------------------------
-# Helpers: EXIF
-# ------------------------------------------------------
-def _to_float(val) -> Optional[float]:
+def read_exif(content_bytes: bytes) -> Dict[str, Any]:
+    """
+    EXIF okumaya çalışır (PNG'lerde genelde yoktur). Hata olmazsa tag'leri döndürür.
+    """
+    tags: Dict[str, Any] = {}
     try:
-        return float(str(val))
+        tags = exifread.process_file(io.BytesIO(content_bytes), details=False)
     except Exception:
-        return None
+        # PNG'lerde normal; sessizce geç
+        pass
+    return tags
 
-def _to_int(val) -> Optional[int]:
+def top3_palette(img: Image.Image) -> List[Dict[str, Any]]:
+    """
+    Hızlı ve bağımlılıksız baskın renkler: downscale + Counter (en çok görünen 3 renk).
+    """
+    arr = np.array(img)
+    # downscale
+    small = arr[::8, ::8, :].reshape(-1, 3)
+    small_tuples = list(map(tuple, small.tolist()))
+    common = Counter(small_tuples).most_common(3)
+    return [{"rgb": list(rgb), "count": int(cnt)} for rgb, cnt in common]
+
+def guess_format(filename: str) -> str:
+    lower = (filename or "").lower()
+    if lower.endswith(".png"):
+        return "png"
+    if lower.endswith(".jpg") or lower.endswith(".jpeg"):
+        return "jpg"
+    if lower.endswith(".webp"):
+        return "webp"
+    if lower.endswith(".gif"):
+        return "gif"
+    return "unknown"
+
+# (Opsiyonel) Google Vision
+def run_google_vision_if_enabled(content_bytes: bytes) -> Dict[str, Any]:
+    """
+    USE_GOOGLE_VISION=1 ise Google Cloud Vision ile basit label/landmark/face özetleri alır.
+    Hata olursa sessizce geçer.
+    """
+    result: Dict[str, Any] = {}
+    if not USE_GOOGLE_VISION:
+        return result
     try:
-        return int(str(val))
-    except Exception:
-        return None
-
-def extract_exif_from_bytes(content: bytes) -> EXIFModel:
-    """
-    EXIF bilgilerini bytes üzerinden okur. PNG'lerde çoğunlukla EXIF yoktur.
-    """
-    try:
-        stream = io.BytesIO(content)
-        tags = exifread.process_file(stream, details=False)
-
-        # Bazı tipik alanlar
-        camera = str(tags.get("Image Model") or "") or None
-        lens = str(tags.get("EXIF LensModel") or "") or None
-
-        focal = tags.get("EXIF FocalLength")
-        aperture = tags.get("EXIF FNumber")
-        iso = tags.get("EXIF ISOSpeedRatings") or tags.get("EXIF PhotographicSensitivity")
-        shutter = tags.get("EXIF ExposureTime")
-        dt = tags.get("EXIF DateTimeOriginal") or tags.get("Image DateTime")
-
-        focal_val = None
-        if focal:
-            # "85/1" gibi gelebilir
-            try:
-                s = str(focal)
-                if "/" in s:
-                    num, den = s.split("/")
-                    focal_val = float(num) / float(den)
-                else:
-                    focal_val = float(s)
-            except Exception:
-                focal_val = None
-
-        aperture_val = None
-        if aperture:
-            try:
-                s = str(aperture)
-                if "/" in s:
-                    num, den = s.split("/")
-                    aperture_val = float(num) / float(den)
-                else:
-                    aperture_val = float(s)
-            except Exception:
-                aperture_val = None
-
-        iso_val = _to_int(iso) if iso else None
-        shutter_val = str(shutter) if shutter else None
-        ts_val = str(dt) if dt else None
-
-        # Boş ise None dönelim
-        if not any([camera, lens, focal_val, aperture_val, iso_val, shutter_val, ts_val]):
-            logger.info("PNG/JPG EXIF not found or minimal.")
-            return EXIFModel()
-
-        return EXIFModel(
-            camera=camera,
-            lens=lens,
-            focal_length=focal_val,
-            aperture=aperture_val,
-            iso=iso_val,
-            shutter=shutter_val,
-            timestamp=ts_val,
-        )
-    except Exception as e:
-        logger.exception("EXIF parse failed")
-        return EXIFModel()
-
-# ------------------------------------------------------
-# Helpers: Palette (no sklearn)
-# ------------------------------------------------------
-def _approx_color_name(rgb):
-    r, g, b = rgb
-    if r > 200 and g > 200 and b > 200:
-        return "white"
-    if r < 35 and g < 35 and b < 35:
-        return "black"
-    if r > g and r > b:
-        return "red-ish"
-    if g > r and g > b:
-        return "green-ish"
-    if b > r and b > g:
-        return "blue-ish"
-    if r > 180 and g > 180 and b < 100:
-        return "yellow-ish"
-    if r > 180 and b > 180 and g < 100:
-        return "magenta-ish"
-    if g > 180 and b > 180 and r < 100:
-        return "cyan-ish"
-    return "neutral"
-
-def cluster_palette(img: Image.Image, k: int = 3) -> List[Dict]:
-    """
-    Pillow ADAPTIVE palette ile hafif palet çıkarımı.
-    """
-    small = img.convert("RGB").resize((128, 128))
-    colors_target = max(k * 3, k)
-    pal_img = small.convert("P", palette=Image.Palette.ADAPTIVE, colors=colors_target)
-
-    palette = pal_img.getpalette()  # [r0,g0,b0, r1,g1,b1, ...]
-    counts = pal_img.getcolors() or []  # [(count, index), ...]
-
-    def idx_to_rgb(idx: int):
-        base = idx * 3
-        return tuple(palette[base:base + 3])
-
-    ranked = sorted(counts, key=lambda x: x[0], reverse=True)
-
-    top = []
-    seen = set()
-    for count, idx in ranked:
-        rgb = idx_to_rgb(idx)
-        if rgb in seen:
-            continue
-        seen.add(rgb)
-        hexcol = "#{:02x}{:02x}{:02x}".format(*rgb)
-        top.append({
-            "hex": hexcol,
-            "rgb": {"r": rgb[0], "g": rgb[1], "b": rgb[2]},
-            "name": _approx_color_name(rgb)
-        })
-        if len(top) >= k:
-            break
-
-    return top
-
-# ------------------------------------------------------
-# Helpers: Google Vision (optional)
-# ------------------------------------------------------
-def google_vision_labels_bytes(content: bytes) -> List[str]:
-    """
-    USE_GOOGLE_VISION=1 ise Google Vision ile label listesi döndürür.
-    """
-    if os.environ.get("USE_GOOGLE_VISION", "0") != "1":
-        return []
-
-    try:
-        from google.cloud import vision  # lazy import
-    except Exception as e:
-        logger.warning(f"google-cloud-vision import failed: {e}")
-        return []
-
-    try:
+        from google.cloud import vision  # type: ignore
         client = vision.ImageAnnotatorClient()
-        image = vision.Image(content=content)
-        resp = client.label_detection(image=image)
-        if resp.error and resp.error.message:
-            logger.error(f"Vision API error: {resp.error.message}")
-            return []
-        labels = [l.description for l in (resp.label_annotations or [])]
-        return labels
+        image = vision.Image(content=content_bytes)
+
+        # Label detection
+        labels_resp = client.label_detection(image=image)
+        labels = [f"{l.description} ({round(l.score,2)})" for l in labels_resp.label_annotations or []]
+
+        # Landmark detection
+        lm_resp = client.landmark_detection(image=image)
+        landmarks = [f"{lm.description} ({round(lm.score,2)})" for lm in lm_resp.landmark_annotations or []]
+
+        # Face detection (sadece count & likelihood)
+        face_resp = client.face_detection(image=image)
+        faces_info = []
+        for f in face_resp.face_annotations or []:
+            faces_info.append({
+                "joy": str(f.joy_likelihood),
+                "sorrow": str(f.sorrow_likelihood),
+                "anger": str(f.anger_likelihood),
+                "surprise": str(f.surprise_likelihood)
+            })
+
+        result = {
+            "labels": labels[:10],
+            "landmarks": landmarks[:5],
+            "faces_likelihood": faces_info[:5]
+        }
     except Exception as e:
-        logger.exception("Vision request failed")
-        return []
+        app.logger.info(f"Google Vision skipped or failed: {e}")
+    return result
 
-# ------------------------------------------------------
-# Helpers: Narrative (basit otomatik özet)
-# ------------------------------------------------------
-def build_narrative(img: Image.Image, tech: Dict) -> NarrativeModel:
-    # Çok basit bir çıkarım. İstersen burada Vision label’ları, paleti, EXIF’i harmanlayıp
-    # daha akıllı bir özet üretecek şekilde genişletebiliriz.
-    labels = tech.get("vision_labels") or []
-    palette = tech.get("palette") or []
+# ---------------------------------------------------------
+# Schemas
+# ---------------------------------------------------------
+class HealthOut(BaseModel):
+    status: str = "ok"
 
-    mood = None
-    if palette:
-        # kaba ton tahmini
-        names = [c["name"] for c in palette]
-        if "blue-ish" in names:
-            mood = "cool / melancholic"
-        elif "yellow-ish" in names:
-            mood = "warm / hopeful"
-        else:
-            mood = "neutral"
-    else:
-        mood = "neutral"
+class AnalyzeOut(BaseModel):
+    technical: Dict[str, Any]
+    narrative: Dict[str, Any]
+    warnings: List[str] = []
+    vision: Optional[Dict[str, Any]] = None
 
-    setting = None
-    if labels:
-        # ör: "Street", "Sky", "Person" gibi
-        if "Street" in labels:
-            setting = "urban street"
-        elif "Sky" in labels:
-            setting = "outdoor with sky"
-        else:
-            setting = "unspecified"
-    else:
-        setting = "unspecified"
-
-    subjects = []
-    if labels:
-        if "Person" in labels:
-            subjects.append("person")
-
-    return NarrativeModel(
-        setting=setting,
-        subjects=subjects,
-        mood=mood,
-        actions=[]
-    )
-
-# ------------------------------------------------------
+# ---------------------------------------------------------
 # Routes
-# ------------------------------------------------------
-@app.get("/")
+# ---------------------------------------------------------
+@app.get("/", response_model=HealthOut)
 def root():
-    return {"status": "ok", "message": "Prompt Generator Analyze API up"}
+    return HealthOut(status="ok")
 
-@app.get("/healthz")
+@app.get("/health", response_model=HealthOut)
 def health():
-    return {"status": "ok"}
+    return HealthOut(status="ok")
 
-@app.post("/analyze-image", response_model=AnalyzeResponse)
-async def analyze_image(file: UploadFile = File(...), x_api_key: str = Header(default=None)):
+@app.post("/analyze-image", response_model=AnalyzeOut)
+async def analyze_image(
+    request: Request,
+    file: Optional[UploadFile] = File(None),
+    image: Optional[UploadFile] = File(None),
+    x_api_key: Optional[str] = Header(None)
+):
     # API Key kontrolü
-    expected_key = os.environ.get("ANALYZE_API_KEY")
-    if not expected_key:
-        logger.warning("ANALYZE_API_KEY not set on server")
-        raise HTTPException(status_code=500, detail="Server missing ANALYZE_API_KEY")
-    if x_api_key != expected_key:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    if ANALYZE_API_KEY:
+        if not x_api_key or x_api_key != ANALYZE_API_KEY:
+            raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # Dosyayı oku + Pillow ile aç
+    # Hangi alan geldi?
+    # (GPT bazen 'file', bazen 'image' alan adını kullanabiliyor.)
+    upload = file or image
+    # Ekstra: hangi alan adları gelmiş, loglayalım
     try:
-        content = await file.read()
-        img = Image.open(io.BytesIO(content)).convert("RGB")
-    except Exception as e:
-        logger.exception("Image read/open failed")
-        raise HTTPException(status_code=400, detail=f"Bad image file: {type(e).__name__}: {e}")
+        form = await request.form()
+        app.logger.info(f"Form fields: {list(form.keys())}")
+    except Exception:
+        pass
 
-    out_errors: Dict[str, str] = {}
-    tech: Dict = {}
-    narrative: Dict = {}
+    if upload is None or getattr(upload, "filename", None) is None:
+        raise HTTPException(status_code=422, detail="No file found in form-data. Expected field 'file' (or 'image').")
+
+    filename = upload.filename or ""
+    fmt = guess_format(filename)
+
+    # Dosyayı bytes olarak da alalım (EXIF & Vision için)
+    try:
+        content_bytes = await upload.read()
+        if not content_bytes:
+            raise ValueError("Empty file content")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read file: {e}")
+
+    # PIL ile aç
+    try:
+        img = Image.open(io.BytesIO(content_bytes)).convert("RGB")
+    except Exception as e:
+        raise HTTPException(status_code=415, detail=f"Unsupported image or read error: {e}")
 
     # EXIF
-    try:
-        exif = extract_exif_from_bytes(content)
-        tech["exif"] = exif.model_dump()
-    except Exception as e:
-        logger.exception("EXIF failed")
-        out_errors["exif"] = f"{type(e).__name__}: {e}"
+    warnings: List[str] = []
+    tags = read_exif(content_bytes)
+    if not tags:
+        app.logger.info("PNG/JPG EXIF not found or minimal.")
+        warnings.append("No EXIF or minimal EXIF (normal for many PNGs).")
 
-    # Palette
-    try:
-        pal = cluster_palette(img, k=3)
-        tech["palette"] = pal
-    except Exception as e:
-        logger.exception("Palette failed")
-        out_errors["palette"] = f"{type(e).__name__}: {e}"
+    # Teknik bilgiler
+    np_img = np.array(img)
+    h, w = np_img.shape[:2]
+    palette = top3_palette(img)
 
-    # Vision (opsiyonel)
-    try:
-        labels = google_vision_labels_bytes(content)
-        if labels:
-            tech["vision_labels"] = labels
-    except Exception as e:
-        logger.exception("Vision failed")
-        out_errors["vision"] = f"{type(e).__name__}: {e}"
+    technical = {
+        "filename": filename,
+        "format_guess": fmt,
+        "resolution": {"width": int(w), "height": int(h)},
+        "approx_palette_top3": palette,
+        "exif_present": bool(tags),
+    }
 
-    # Narrative
-    try:
-        nar = build_narrative(img, tech)
-        narrative = nar.model_dump()
-    except Exception as e:
-        logger.exception("Narrative failed")
-        out_errors["narrative"] = f"{type(e).__name__}: {e}"
+    # Basit anlatı (narrative) iskeleti — asıl derin analiz GPT tarafında yapılacak
+    narrative = {
+        "notes": "Basic technical cues extracted. Use these as grounding for your cinematic prompt builder.",
+        "hints": [
+            "If human subject: confirm age/gender/ethnicity & micro-imperfections.",
+            "Confirm lighting type (natural/artificial), softness/hardness, direction.",
+            "Confirm camera angle & focal length intent; add aperture for bokeh level.",
+            "Describe environment style & texture (asphalt, neon, graffitis), imperfections.",
+            "Add color palette as 60/30/10 using detected top colors + your taste."
+        ]
+    }
 
-    status = "ok" if not out_errors else "partial_success"
+    # (Opsiyonel) Google Vision
+    vision = run_google_vision_if_enabled(content_bytes)
+    if vision:
+        technical["vision_labels_count"] = len(vision.get("labels", []))
 
-    return AnalyzeResponse(
-        status=status,
-        tech=TechModel(**tech),
-        narrative=NarrativeModel(**narrative),
-        errors=out_errors
+    return AnalyzeOut(
+        technical=technical,
+        narrative=narrative,
+        warnings=warnings,
+        vision=vision or None
     )
-
-# ------------------------------------------------------
-# Run locally (optional)
-# ------------------------------------------------------
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", "8000"))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
