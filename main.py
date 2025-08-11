@@ -138,10 +138,11 @@ def _technical_from_pil(image: Image.Image, filename: str, exif: Dict[str, Any])
 # ---- Asıl endpoint (ASYNC ve sağlam) ----
 @app.post("/analyze-image")
 async def analyze_image(
-    request: Request,
-    file: Optional[UploadFile] = File(default=None),
-    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+    file: UploadFile = File(...),
+    x_api_key: Optional[str] = Header(None),
 ):
+    ...
+
     # 1) Auth
     if API_KEY and (x_api_key or "").strip() != API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized: invalid API key")
