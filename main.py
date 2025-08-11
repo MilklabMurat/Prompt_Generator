@@ -18,6 +18,9 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("app")
 
 app = FastAPI(title="Image Analysis API", version="1.0.0")
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 app.add_middleware(
     CORSMiddleware,
